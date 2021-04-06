@@ -1,0 +1,214 @@
+---
+title: "assessment"
+author: "Gabriel Hendergate"
+date: "26/03/2021"
+output: html_document
+---
+# Setup Working Environment
+```{r setup, results='hide', warning=FALSE, message=FALSE}
+## Set up the working environment
+knitr::opts_chunk$set(echo = TRUE)
+intervalStart <- Sys.time()
+library(readr) # for reading the data in
+library(caret) # for training the models
+library(tidyr) # useful for Filtering etc.
+library(elasticnet) # for lasso training method
+library(mboost) # for boostglm
+library(dplyr)
+library(Hmisc)
+library(ggcorrplot)
+
+set.seed(987654321) # for reproducibility
+```
+
+```{r parallel processing, results='hide', warning=FALSE, message=FALSE}
+## Set up the parallel processing
+library(parallel)
+library(doParallel)
+cluster <- parallel::makeCluster(detectCores() - 1) # leave 1 core for OS
+doParallel::registerDoParallel(cluster)
+```
+
+# Feature Reduction and Cross-Validation
+The first step was to prepare the data by filtering out any features which were not useful. Only the sensor measurement variables which described the participant motion were kept: gyroscope, magnetometer, and accellerometer for Euler angles.
+```{r getData, results='hide', warning=FALSE, message=FALSE}
+df_train_raw <- readr::read_csv("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv")
+df_train_raw <- dplyr::select(df_train_raw, 
+                              matches("(^classe|^roll_|^pitch_|^yaw_|^gyros_|^accel_|^magnet_)"))
+```
+The correlation between variables was determined using the Pearson method. The Spearman method was not used because the sensor data is continuous rather than categorical, so measuring the linear relationship between variables was appropriate. 
+```{r variable correlation, results='hide', warning=FALSE}
+
+## Filter the data to the minimum required number of variables
+# remove columns with more than 90% NA values
+
+df_train_fltr <- Filter(function(x) (sum(!is.na(x)) / length(x)) > 0.9,
+                        df_train_raw)
+# Convert the character columns into numeric to allow use in correlation function
+df_train_fltr_num <- as.data.frame(lapply(
+  df_train_fltr,
+  function(x) {
+    if (is.character(x)) {
+      as.numeric(as.factor(x))
+    }
+    else {
+      x
+    }
+  }
+))
+
+correlations <- Hmisc::rcorr(as.matrix(df_train_fltr_num), type = "pearson")
+c.c <- correlations$r
+c.p <- correlations$P
+ggcorrplot(c.c, hc.order = TRUE, type = "lower", p.mat = c.p, insig = "blank") +
+  theme(axis.text.x = element_text(angle = 90))
+```
+
+
+Because there were a large number of features it was neccesary to reduce the set, both for computational efficiency and to avoid over-fitting the training set. The variables which showed a greater than 5% correlation to the response, classe, were selected, if the correlation was shown to be significant with a p-value less than 5%. This reduced the number of features to 20, down from 48, which was felt to be a reasonable data set. To reduce the data set further one could remove features which are highly correlated to other features, keeping those that were most correlated to the response - this would help further reduce the risk of over-fitting. After the feature reduction, the data set was partitioned using random subsampling into 75% training and 25% test sets such that the algorithms could be evaluated. Finally, a ten-fold cross validation method was chosen to improve the model by reducing bias.
+```{r feature selection, results='hide', warning=FALSE}
+
+flattenCorrMatrix <- function(cormat, pmat) {
+  #' @description : flatten the correlation matrix into a data.frame for ease
+  #'                of data manipulation
+  #' @param cormat : matrix of the correlation coefficients
+  #' @param pmat : matrix of the correlation p-values
+  ut <- upper.tri(cormat)
+  data.frame(
+    row = rownames(cormat)[row(cormat)[ut]],
+    column = rownames(cormat)[col(cormat)[ut]],
+    cor = (cormat)[ut],
+    p = pmat[ut]
+  )
+}
+df_c <- flattenCorrMatrix(c.c, c.p)
+
+# Filter out any columns which have a p value < 5% and correlation to classe >5%
+df_c_classe <- df_c[df_c$column == "classe" & 
+                      df_c$p < 0.05 & abs(df_c$cor) > 0.05, ]
+df_train_cor <- df_train_fltr[, c("classe", df_c_classe$row)]
+
+# Partition the training data set into a training and test set
+inTrain <- caret::createDataPartition(df_train_cor$classe,
+                                      p = 0.75, 
+                                      list = FALSE)
+df_train <- df_train_cor[inTrain, ]
+df_test <- df_train_cor[-inTrain, ]
+
+
+# Setup parallel processes for caret train argument:trControl
+kFolds <- 10
+fitControl <- caret::trainControl(
+  method = "cv",
+  number = kFolds, # ten-fold cross validation
+  allowParallel = TRUE,
+  savePredictions = "all", 
+  verboseIter = FALSE, 
+  classProbs = TRUE
+)
+
+```
+
+# Modelling Algorithm
+
+The following modelling methods were chosen: random forest, stochastic gradient boosting, bagged classification and regression tree (CART). These were selected due to their applicability to continuous regressors with a multi-factor categorical outcome. The model used by the original authors achieved an accuracy of 99.41% [1], using a much larger data set than used in this study, which was used as the reference accuracy which the presented models would be compared against.
+
+
+```{r random forest, results='hide', warning=FALSE}
+
+# 2-3 minutes on 19 cores
+
+model_rf <- caret::train(classe ~ .,
+  data = df_train,
+  method = "rf",
+  trControl = fitControl
+)
+predict_rf <- predict(model_rf, df_test)
+cm_rf <- caret::confusionMatrix(as.factor(df_test$classe), predict_rf)
+```
+
+```{r stochastic gradient boosting, results='hide', warning=FALSE}
+
+# 1-2 minutes on 19 cores
+model_gbm <- caret::train(classe ~ .,
+  data = df_train,
+  method = "gbm",
+  trControl = fitControl
+)
+
+predict_gbm <- predict(model_gbm, df_test)
+cm_gbm <- caret::confusionMatrix(as.factor(df_test$classe), predict_gbm)
+```
+
+```{r bagged classification and regression tree (CART), results='hide', warning=FALSE}
+
+# <1 minute of 19 cores
+
+model_treebag <- caret::train(classe ~ .,
+  data = df_train,
+  method = "treebag",
+  trControl = fitControl
+)
+
+predict_treebag <- predict(model_treebag, df_test)
+cm_treebag <- caret::confusionMatrix(as.factor(df_test$classe), predict_treebag)
+print(cm_treebag)
+```
+
+Plotting the accuracy (out of sample expected error) of each model shows that no model was able to match that of the reference study, which is likely due to the extra care the authors took in reducing the features, and the larger data set that they worked with likely reduced any bias in the results. Nonetheless, it is likely from this result that the authors used a random forest approach, which achieved the highest accuracy.
+
+```{r}
+
+# Plot the results
+df_results_table <- data.frame(Model = c('Stochastic Gradient Boosting',
+                                   'Random Forest',
+                                    'Bagged CART',
+                                   'Target'),
+                         Accuracy = c(cm_gbm$overall['Accuracy'][[1]],
+                                      cm_rf$overall['Accuracy'][[1]],
+                                     cm_treebag$overall['Accuracy'][[1]],
+                                     0.994144))
+df_results <- data.frame(Model = c(rep('Stochastic Gradient Boosting', kFolds),
+                                    rep('Random Forest', kFolds),
+                                    rep('Bagged CART', kFolds)),
+                         Accuracy = c(model_gbm$resample$Accuracy,
+                                      model_rf$resample$Accuracy,
+                                      model_treebag$resample$Accuracy),
+                         Kappa = c(model_gbm$resample$Kappa,
+                                      model_rf$resample$Kappa,
+                                      model_treebag$resample$Kappa))
+ggplot(data = df_results) + 
+  geom_density(aes(x = Accuracy, colour = Model)) + 
+  geom_point(aes(x = Accuracy, y = 0, colour = Model), alpha = 0.25) + 
+  scale_x_continuous(limits = c(0.9, 1), breaks = seq(0.9, 1, 0.01)) + 
+  labs(title = 'Comparison of Model Accuracy') + 
+  geom_vline(data = df_results_table, aes(xintercept = Accuracy, colour = Model))
+```
+
+
+```{r stopParallel, results='hide', warning=FALSE, message=FALSE}
+
+# The parallel processing is discontinued after the models have been trained
+stopCluster(cluster)
+registerDoSEQ()
+```
+
+## References
+[1] Ugulino, W.; Cardador, D.; Vega, K.; Velloso, E.; Milidiu, R.; Fuks, H. Wearable Computing: Accelerometers' Data Classification of Body Postures and Movements. Proceedings of 21st Brazilian Symposium on Artificial Intelligence. Advances in Artificial Intelligence - SBIA 2012. In: Lecture Notes in Computer Science. , pp. 52-61. Curitiba, PR: Springer Berlin / Heidelberg, 2012. ISBN 978-3-642-34458-9. DOI: 10.1007/978-3-642-34459-6_6.
+
+Available at: http:/groupware.les.inf.puc-rio.br/har#sbia_paper_section#ixzz4Tju63y81
+
+
+```{r session}
+sessionInfo()
+```
+
+# Validation (Quiz)
+
+Both the bagged CART and random forest methods achieved 100% accuracy during validation, while the stochastic gradient boosting method achieved only an 85% accuracy.
+```{r validation, results='hide', warning=FALSE, message=FALSE}
+df_quiz_raw <- readr::read_csv("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv")
+df_quiz_raw <- df_quiz_raw[, names(df_quiz_raw) %in% names(df_train)]
+
+predict_quiz <- predict(model_rf, df_quiz_raw)
+```
